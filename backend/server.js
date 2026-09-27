@@ -1,72 +1,78 @@
 
-const path = require("path");
-const dotenv = require("dotenv");
-
-// Load environment variables
-const envResult = dotenv.config({
-  path: path.join(__dirname, ".env"),
-});
-
-if (envResult.error) {
-  console.error("Unable to load .env:", envResult.error.message);
-  process.exit(1);
-}
+require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
 const session = require("express-session");
+const { MongoStore } = require("connect-mongo");
 const { MongoClient } = require("mongodb");
 const bcrypt = require("bcrypt");
 const sanitizeHtml = require("sanitize-html");
 
 const app = express();
 
-const PORT = Number(process.env.PORT) || 3001;
+const PORT = process.env.PORT || 3001;
 const MONGO_URI = process.env.MONGO_URI;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const FRONTEND_URL =
   process.env.FRONTEND_URL || "http://localhost:5173";
 
-const saltRounds = 10;
+const isProduction = process.env.NODE_ENV === "production";
 
-// Check environment variables
+// Check required environment variables
 if (!MONGO_URI || !SESSION_SECRET) {
   console.error(
-    "Missing MONGO_URI or SESSION_SECRET in backend/.env"
+    "Missing MONGO_URI or SESSION_SECRET environment variable"
   );
   process.exit(1);
 }
 
-// Middleware
+// Trust Render's HTTPS reverse proxy
+if (isProduction) {
+  app.set("trust proxy", 1);
+}
+
+// Allow React frontend
 app.use(
   cors({
     origin: FRONTEND_URL,
     credentials: true,
-    optionsSuccessStatus: 200,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
   })
 );
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Session configuration
-// MemoryStore is suitable only for local development.
+// Store sessions in MongoDB so they survive server restarts
+const sessionStore = MongoStore.create({
+  mongoUrl: MONGO_URI,
+  dbName: "login-system",
+  collectionName: "sessions",
+  ttl: 24 * 60 * 60,
+});
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  maxAge: 24 * 60 * 60 * 1000,
+  path: "/",
+};
+
 app.use(
   session({
     name: "nexaauth.sid",
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: false, // Local HTTP development only
-      sameSite: "lax",
-      maxAge: 24 * 60 * 60 * 1000,
-    },
+    store: sessionStore,
+    cookie: cookieOptions,
   })
 );
 
-// Database
+// MongoDB
 let client;
 let usersCollection;
 
@@ -107,10 +113,24 @@ function publicUser(user) {
   };
 }
 
+function saveLoginSession(req, user, callback) {
+  req.session.regenerate((error) => {
+    if (error) {
+      return callback(error);
+    }
+
+    req.session.name = user.name;
+    req.session.email = user.email;
+
+    req.session.save(callback);
+  });
+}
+
 // Home
 app.get("/", (req, res) => {
   res.json({
-    message: "NexaAuth backend is running",
+    success: true,
+    message: "NexaAuth Backend is running",
   });
 });
 
@@ -133,8 +153,8 @@ app.get("/profile", (req, res) => {
 
   return res.json({
     success: true,
-    email: req.session.email,
     name: req.session.name,
+    email: req.session.email,
   });
 });
 
@@ -148,7 +168,6 @@ app.post("/register", async (req, res) => {
       confirmPassword,
     } = req.body || {};
 
-    // Required fields
     if (
       typeof name !== "string" ||
       typeof email !== "string" ||
@@ -185,17 +204,17 @@ app.post("/register", async (req, res) => {
       });
     }
 
-    if (password.length < 6) {
+    if (password.length < 8) {
       return res.status(400).json({
         success: false,
-        message: "Password must contain at least 6 characters",
+        message: "Password must contain at least 8 characters",
       });
     }
 
-    if (password.length > 72) {
+    if (Buffer.byteLength(password, "utf8") > 72) {
       return res.status(400).json({
         success: false,
-        message: "Password must not exceed 72 characters",
+        message: "Password is too long",
       });
     }
 
@@ -217,10 +236,9 @@ app.post("/register", async (req, res) => {
       });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(
       password,
-      saltRounds
+      10
     );
 
     const newUser = {
@@ -232,33 +250,20 @@ app.post("/register", async (req, res) => {
 
     await usersCollection.insertOne(newUser);
 
-    // Create a fresh session
-    req.session.regenerate((error) => {
+    saveLoginSession(req, newUser, (error) => {
       if (error) {
-        console.error("Session creation failed");
+        console.error("Registration session error:", error.message);
+
         return res.status(500).json({
           success: false,
-          message: "Account created, but login failed",
+          message: "Account created, but automatic login failed",
         });
       }
 
-      req.session.name = cleanName;
-      req.session.email = cleanEmail;
-
-      return req.session.save((saveError) => {
-        if (saveError) {
-          console.error("Session save failed");
-          return res.status(500).json({
-            success: false,
-            message: "Account created, but login failed",
-          });
-        }
-
-        return res.status(201).json({
-          success: true,
-          message: "Registration successful",
-          user: publicUser(newUser),
-        });
+      return res.status(201).json({
+        success: true,
+        message: "Registration successful",
+        user: publicUser(newUser),
       });
     });
   } catch (error) {
@@ -308,7 +313,6 @@ app.post("/login", async (req, res) => {
       email: cleanEmail,
     });
 
-    // Use a generic message for invalid credentials.
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -328,33 +332,20 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // Prevent session fixation
-    req.session.regenerate((error) => {
+    saveLoginSession(req, user, (error) => {
       if (error) {
-        console.error("Session creation failed");
+        console.error("Login session error:", error.message);
+
         return res.status(500).json({
           success: false,
-          message: "Unable to create session",
+          message: "Unable to create login session",
         });
       }
 
-      req.session.name = user.name;
-      req.session.email = user.email;
-
-      return req.session.save((saveError) => {
-        if (saveError) {
-          console.error("Session save failed");
-          return res.status(500).json({
-            success: false,
-            message: "Unable to save session",
-          });
-        }
-
-        return res.status(200).json({
-          success: true,
-          message: "Login successful",
-          user: publicUser(user),
-        });
+      return res.json({
+        success: true,
+        message: "Login successful",
+        user: publicUser(user),
       });
     });
   } catch (error) {
@@ -381,8 +372,8 @@ app.post("/logout", (req, res) => {
 
     res.clearCookie("nexaauth.sid", {
       httpOnly: true,
-      secure: false,
-      sameSite: "lax",
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
       path: "/",
     });
 
@@ -393,25 +384,23 @@ app.post("/logout", (req, res) => {
   });
 });
 
-// Handle unexpected errors
+// Unexpected errors
 app.use((error, req, res, next) => {
   console.error("Server error:", error.message);
 
-  res.status(500).json({
+  return res.status(500).json({
     success: false,
     message: "Internal server error",
   });
 });
 
-// Start backend only after MongoDB connects
+// Start server only after MongoDB connects
 async function startServer() {
   try {
     await connectDB();
 
-    app.listen(PORT, () => {
-      console.log(
-        `Server running on http://localhost:${PORT}`
-      );
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on port ${PORT}`);
     });
   } catch (error) {
     console.error(

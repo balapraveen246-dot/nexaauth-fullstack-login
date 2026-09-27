@@ -1,163 +1,430 @@
-const path = require('path');
-const dotenv = require('dotenv');
 
-const result = dotenv.config({ path: path.join(__dirname, '.env') });
+const path = require("path");
+const dotenv = require("dotenv");
 
-const express = require('express');
+// Load environment variables
+const envResult = dotenv.config({
+  path: path.join(__dirname, ".env"),
+});
+
+if (envResult.error) {
+  console.error("Unable to load .env:", envResult.error.message);
+  process.exit(1);
+}
+
+const express = require("express");
+const cors = require("cors");
+const session = require("express-session");
+const { MongoClient } = require("mongodb");
+const bcrypt = require("bcrypt");
+const sanitizeHtml = require("sanitize-html");
+
 const app = express();
-const port = process.env.PORT || 3001;
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const session = require('express-session');
-const { MongoClient } = require('mongodb');
-const bcrypt = require('bcrypt');
+
+const PORT = Number(process.env.PORT) || 3001;
+const MONGO_URI = process.env.MONGO_URI;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || "http://localhost:5173";
+
 const saltRounds = 10;
-const sanitizeHtml = require('sanitize-html');
 
+// Check environment variables
+if (!MONGO_URI || !SESSION_SECRET) {
+  console.error(
+    "Missing MONGO_URI or SESSION_SECRET in backend/.env"
+  );
+  process.exit(1);
+}
 
-const corsOptions = {
-  origin: 'http://localhost:5173',
-  credentials: true,
-  optionsSuccessStatus: 200
-};
+// Middleware
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+    optionsSuccessStatus: 200,
+  })
+);
 
-app.use(cors(corsOptions));
-
-app.use(bodyParser.json());
-
+app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-app.use(session({
-  secret: 'something',
-  resave: false,
-  saveUninitialized: false,
-}));
+// Session configuration
+// MemoryStore is suitable only for local development.
+app.use(
+  session({
+    name: "nexaauth.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: false, // Local HTTP development only
+      sameSite: "lax",
+      maxAge: 24 * 60 * 60 * 1000,
+    },
+  })
+);
 
-app.use(express.static(path.join(__dirname, '/dist')));
-
-const uri = process.env.MONGO_URI;
+// Database
 let client;
+let usersCollection;
 
 async function connectDB() {
-  try {
-    client = new MongoClient(uri);
-    await client.connect();
-    console.log('Connected to MongoDB Atlas');
-  } catch (error) {
-    console.error('Failed to connect to MongoDB Atlas', error);
-  }
+  client = new MongoClient(MONGO_URI, {
+    serverSelectionTimeoutMS: 10000,
+  });
+
+  await client.connect();
+
+  const database = client.db("login-system");
+  usersCollection = database.collection("users");
+
+  await usersCollection.createIndex(
+    { email: 1 },
+    { unique: true }
+  );
+
+  console.log("Connected to MongoDB Atlas");
 }
 
-connectDB();
-
-app.get('/', (req, res) => {
-  res.send('Hello World!')
-});
-
-app.get('/profile', (req, res) => {
-  if (!req.session.email) {
-    return res.status(200).send({ message: 'Not logged in' });
-  } else {
-    return res.send({ email: req.session.email, name: req.session.name });
-  }
-});
-
-function sanitizeInput(input) {
-  return sanitizeHtml(input, {
-    allowedTags: [],  
-    allowedAttributes: {},  
+// Helpers
+function cleanText(value) {
+  return sanitizeHtml(value.trim(), {
+    allowedTags: [],
+    allowedAttributes: {},
   });
 }
 
-app.post('/login', async (req, res) => {
-  let email = req.body.email;
-  let password = req.body.password;
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 
-  email = sanitizeInput(email);
-  password = sanitizeInput(password);
+function publicUser(user) {
+  return {
+    name: user.name,
+    email: user.email,
+  };
+}
 
+// Home
+app.get("/", (req, res) => {
+  res.json({
+    message: "NexaAuth backend is running",
+  });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    database: usersCollection ? "Connected" : "Unavailable",
+  });
+});
+
+// Profile
+app.get("/profile", (req, res) => {
+  if (!req.session.email) {
+    return res.status(401).json({
+      success: false,
+      message: "Not logged in",
+    });
+  }
+
+  return res.json({
+    success: true,
+    email: req.session.email,
+    name: req.session.name,
+  });
+});
+
+// Register
+app.post("/register", async (req, res) => {
   try {
-    const database = client.db('login-system');
-    const usersCollection = database.collection('users');
+    const {
+      name,
+      email,
+      password,
+      confirmPassword,
+    } = req.body || {};
 
-    const user = await usersCollection.findOne({ email: email });
-
-    if (user) {
-      const match = await bcrypt.compare(password, user.password);
-
-      if (match) {
-        req.session.name = user.name;
-        req.session.email = email; 
-        res.send({ success: true, user }); 
-      } else {
-        res.status(400).send({ success: false, message: 'Incorrect email and password' }); 
-      }
-    } else {
-      res.status(400).send({ success: false, message: 'User not found' }); 
+    // Required fields
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      typeof confirmPassword !== "string" ||
+      !name.trim() ||
+      !email.trim() ||
+      !password ||
+      !confirmPassword
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required",
+      });
     }
+
+    const cleanName = cleanText(name);
+    const cleanEmail = email.trim().toLowerCase();
+
+    if (!cleanName || cleanName.length > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid name",
+      });
+    }
+
+    if (
+      cleanEmail.length > 254 ||
+      !validEmail(cleanEmail)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid email address",
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must contain at least 6 characters",
+      });
+    }
+
+    if (password.length > 72) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must not exceed 72 characters",
+      });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "Passwords do not match",
+      });
+    }
+
+    const existingUser = await usersCollection.findOne({
+      email: cleanEmail,
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "Email already exists",
+      });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(
+      password,
+      saltRounds
+    );
+
+    const newUser = {
+      name: cleanName,
+      email: cleanEmail,
+      password: hashedPassword,
+      createdAt: new Date(),
+    };
+
+    await usersCollection.insertOne(newUser);
+
+    // Create a fresh session
+    req.session.regenerate((error) => {
+      if (error) {
+        console.error("Session creation failed");
+        return res.status(500).json({
+          success: false,
+          message: "Account created, but login failed",
+        });
+      }
+
+      req.session.name = cleanName;
+      req.session.email = cleanEmail;
+
+      return req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Session save failed");
+          return res.status(500).json({
+            success: false,
+            message: "Account created, but login failed",
+          });
+        }
+
+        return res.status(201).json({
+          success: true,
+          message: "Registration successful",
+          user: publicUser(newUser),
+        });
+      });
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ success: false, message: 'Error during the login process' });
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: "Email already exists",
+      });
+    }
+
+    console.error("Registration error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Error during registration",
+    });
   }
 });
 
-app.post('/register', async (req, res) => {
-  let name = req.body.name;
-  let email = req.body.email;
-  let password = req.body.password;
-  let confirmPassword = req.body.confirmPassword;
+// Login
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
 
-  name = sanitizeInput(name);
-  email = sanitizeInput(email);
-  password = sanitizeInput(password);
-  confirmPassword = sanitizeInput(confirmPassword);
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password are required",
+      });
+    }
 
-  if (password !== confirmPassword) {
-    return res.status(400).send({ success: false, message: 'Passwords do not match.' }); 
-  } 
-    const database = client.db('login-system');
-    const usersCollection = database.collection('users');
-    const userExists = await usersCollection.findOne({ email: email });
+    const cleanEmail = email.trim().toLowerCase();
 
-      if (userExists) {
-        return res.status(400).send({ success: false, message: 'Email already exists.'});
+    if (!validEmail(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid email address",
+      });
+    }
+
+    const user = await usersCollection.findOne({
+      email: cleanEmail,
+    });
+
+    // Use a generic message for invalid credentials.
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!passwordMatches) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
+      });
+    }
+
+    // Prevent session fixation
+    req.session.regenerate((error) => {
+      if (error) {
+        console.error("Session creation failed");
+        return res.status(500).json({
+          success: false,
+          message: "Unable to create session",
+        });
       }
 
-      try {
-        const hashedPassword = await bcrypt.hash(password, saltRounds);
+      req.session.name = user.name;
+      req.session.email = user.email;
 
-        const newUser = {
-          name: name, 
-          email: email,
-          password: hashedPassword
-        };
+      return req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Session save failed");
+          return res.status(500).json({
+            success: false,
+            message: "Unable to save session",
+          });
+        }
 
-        const result = await usersCollection.insertOne(newUser);
+        return res.status(200).json({
+          success: true,
+          message: "Login successful",
+          user: publicUser(user),
+        });
+      });
+    });
+  } catch (error) {
+    console.error("Login error:", error.message);
 
-        console.log("User added!");
-
-        req.session.name = name;
-        req.session.email = email;
-
-       return  res.status(201).send({ success: true, message: 'Registration successful!', user: newUser});
-
-      } catch (error) { 
-        console.error(error);
-       return  res.status(500).send({ success: false, message: 'Error during the registration.'});
-      }
-      
+    return res.status(500).json({
+      success: false,
+      message: "Error during login",
+    });
+  }
 });
 
-app.post('/logout', (req, res) => {
-  if (!req.session.email) {
-    res.send('Already logged out');
-  }
-  req.session.destroy(function () {
-    res.send('Logged out!');
-    console.log('User logged out');
+// Logout
+app.post("/logout", (req, res) => {
+  req.session.destroy((error) => {
+    if (error) {
+      console.error("Logout error:", error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: "Logout failed",
+      });
+    }
+
+    res.clearCookie("nexaauth.sid", {
+      httpOnly: true,
+      secure: false,
+      sameSite: "lax",
+      path: "/",
+    });
+
+    return res.json({
+      success: true,
+      message: "Logged out successfully",
+    });
   });
 });
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
+// Handle unexpected errors
+app.use((error, req, res, next) => {
+  console.error("Server error:", error.message);
+
+  res.status(500).json({
+    success: false,
+    message: "Internal server error",
+  });
 });
+
+// Start backend only after MongoDB connects
+async function startServer() {
+  try {
+    await connectDB();
+
+    app.listen(PORT, () => {
+      console.log(
+        `Server running on http://localhost:${PORT}`
+      );
+    });
+  } catch (error) {
+    console.error(
+      "Backend startup failed:",
+      error.message
+    );
+
+    if (client) {
+      await client.close();
+    }
+
+    process.exit(1);
+  }
+}
+
+startServer();
